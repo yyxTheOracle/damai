@@ -1,0 +1,106 @@
+<hierarchy rotation="0">
+  <node text="" resource-id="" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,140]">
+    <node text="" resource-id="com.android.systemui:id/status_bar_launch_animation_container" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,140]" />
+    <node text="" resource-id="com.android.systemui:id/status_bar_container" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1196,140]">
+      <node text="" resource-id="" class="androidx.compose.ui.platform.ComposeView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1196,140]">
+        <node text="" resource-id="" class="android.view.View" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1196,140]">
+          <node text="" resource-id="" class="androidx.compose.ui.viewinterop.ViewFactoryHolder" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1196,140]">
+            <node text="" resource-id="com.android.systemui:id/status_bar" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1196,140]">
+              <node text="" resource-id="com.android.systemui:id/status_bar_icons" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1196,140]">
+                <node text="" resource-id="com.android.systemui:id/status_bar_contents" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[65,0][1127,140]">
+                  <node text="" resource-id="com.android.systemui:id/phone_status_bar_left_container" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[69,26][562,120]">
+                    <node text="" resource-id="com.android.systemui:id/clock" class="android.widget.TextView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[79,26][203,120]" />
+                    <node text="" resource-id="com.android.systemui:id/notification_icon_area" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[213,26][562,120]">
+                      <node text="" resource-id="com.android.systemui:id/notificationIcons" class="android.view.ViewGroup" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[213,26][271,120]">
+                        <node text="" resource-id="" class="" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[213,26][271,120]" />
+                      </node>
+                    </node>
+                  </node>
+                  <node text="" resource-id="com.android.systemui:id/cutout_space_view" class="android.view.View" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[562,3][630,140]" />
+                  <node text="" resource-id="com.android.systemui:id/system_icon_area" class="android.view.ViewGroup" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[630,26][1123,120]">
+                    <node text="" resource-id="com.android.systemui:id/system_icons" class="android.view.ViewGroup" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[630,26][1123,120]">
+                      <node text="" resource-id="com.android.systemui:id/statusIcons" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[634,26][1006,120]">
+                        <node text="" resource-id="com.android.systemui:id/fullscreen_network_speed_view" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[657,40][721,105]">
+                          <node text="" resource-id="com.android.systemui:id/network_speed_container" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[662,40][721,105]">
+                            <node text="" resource-id="com.android.systemui:id/network_speed_unit" class="android.widget.TextView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[662,70][721,98]" />
+                            <node text="" resource-id="com.android.systemui:id/network_speed_number" class="android.widget.TextView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[665,41][717,73]" />
+                          </node>
+                        </node>
+                        <node text="" resource-id="" class="" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[721,40][789,105]" />
+                        <node text="" resource-id="com.android.systemui:id/mobile_combo" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[789,40][865,105]">
+                          <node text="" resource-id="com.android.systemui:id/mobile_group" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[789,40][865,105]">
+                            <node text="" resource-id="com.android.systemui:id/mobile_signal_container" class="android.view.ViewGroup" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[789,40][865,105]">
+                              <node text="" resource-id="com.android.systemui:id/mobile_type" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[789,46][822,66]" />
+                              <node text="" resource-id="com.android.systemui:id/mobile_signal" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[800,40][865,105]" />
+                            </node>
+                          </node>
+                        </node>
+                        <node text="" resource-id="com.android.systemui:id/mobile_combo" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[865,40][941,105]">
+                          <node text="" resource-id="com.android.systemui:id/mobile_group" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[865,40][941,105]">
+                            <node text="" resource-id="com.android.systemui:id/mobile_signal_container" class="android.view.ViewGroup" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[865,40][941,105]">
+                              <node text="" resource-id="com.android.systemui:id/mobile_type" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[865,46][898,66]" />
+                              <node text="" resource-id="com.android.systemui:id/mobile_signal" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[876,40][941,105]" />
+                            </node>
+                          </node>
+                        </node>
+                        <node text="" resource-id="com.android.systemui:id/wifi_combo" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[941,40][1006,105]">
+                          <node text="" resource-id="com.android.systemui:id/wifi_group" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[941,40][1006,105]">
+                            <node text="" resource-id="com.android.systemui:id/wifi_signal" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[941,40][1006,105]" />
+                            <node text="" resource-id="com.android.systemui:id/wifi_activity" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[941,40][961,105]" />
+                            <node text="" resource-id="com.android.systemui:id/wifi_standard" class="android.widget.TextView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[982,68][1006,105]" />
+                          </node>
+                        </node>
+                      </node>
+                      <node text="" resource-id="com.android.systemui:id/battery" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[1006,26][1123,120]">
+                        <node text="" resource-id="com.android.systemui:id/battery_icon_container" class="android.widget.FrameLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[1006,26][1097,120]">
+                          <node text="" resource-id="com.android.systemui:id/hollow_battery_image" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[1006,40][1097,105]" />
+                        </node>
+                        <node text="" resource-id="com.android.systemui:id/battery_charge_out_image" class="android.widget.ImageView" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[1097,26][1123,120]" />
+                      </node>
+                    </node>
+                  </node>
+                </node>
+              </node>
+              <node text="" resource-id="com.android.systemui:id/privacy_area" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[1123,0][1192,140]">
+                <node text="" resource-id="com.android.systemui:id/privacy_container" class="android.widget.LinearLayout" package="com.android.systemui" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[1133,26][1154,120]" />
+              </node>
+            </node>
+          </node>
+        </node>
+      </node>
+    </node>
+  </node>
+  <node text="" resource-id="" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2670]">
+    <node text="" resource-id="" class="android.widget.LinearLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2670]">
+      <node text="" resource-id="" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2670]">
+        <node text="" resource-id="cn.damai:id/water_mark_view_id" class="android.view.View" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2670]" />
+        <node text="" resource-id="cn.damai:id/action_bar_root" class="android.widget.LinearLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2670]">
+          <node text="" resource-id="android:id/content" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2670]">
+            <node text="" resource-id="" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]">
+              <node text="" resource-id="" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]">
+                <node text="" resource-id="cn.damai:id/scheme_project_detail_flyt" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]">
+                  <node text="" resource-id="cn.damai:id/id_new_skeleton" class="android.view.View" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]" />
+                  <node text="" resource-id="" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]">
+                    <node text="" resource-id="" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]">
+                      <node text="" resource-id="cn.damai:id/id_new_skeleton" class="android.view.View" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]" />
+                      <node text="" resource-id="cn.damai:id/project_bottom_container" class="android.widget.RelativeLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,0][1200,2605]">
+                        <node text="" resource-id="cn.damai:id/project_item_bottom_bar_lv" class="android.view.ViewGroup" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[0,2400][1200,2605]">
+                          <node text="" resource-id="cn.damai:id/project_bottom_customer_follow_container_lv_concert_type" class="android.widget.LinearLayout" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[32,2400][341,2605]">
+                            <node text="" resource-id="cn.damai:id/project_item_bottom_customer_service_lv" class="android.widget.FrameLayout" package="cn.damai" content-desc="" clickable="true" enabled="true" visible-to-user="true" bounds="[58,2400][129,2605]">
+                              <node text="" resource-id="cn.damai:id/project_item_bottom_customer_service_iconf" class="android.widget.TextView" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[58,2439][129,2511]" />
+                              <node text="帮助" resource-id="" class="android.widget.TextView" package="cn.damai" content-desc="" clickable="false" enabled="true" visible-to-user="true" bounds="[60,2529][126,2572]" />
+                            </node>
+                          </node>
+                        </node>
+                      </node>
+                    </node>
+                  </node>
+                </node>
+              </node>
+            </node>
+          </node>
+        </node>
+      </node>
+    </node>
+  </node>
+</hierarchy>

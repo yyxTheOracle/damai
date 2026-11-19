@@ -1,38 +1,39 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import json
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from typing import Callable
 from xml.etree import ElementTree as ET
 
 import uiautomator2 as u2
+import run_log
 
 from damai_android_tail import run_tail_probe_loop
+from device_support import SCREEN_SIZES, XIAOMI_15_MODEL, XIAOMI_15_MAIN_ACTION_POINT, default_adb_path
+from scoped_input import ScopedInput, TargetMismatch
+from xiaomi_ui import ALIPAY_PACKAGE, parse_page, screen_size_matches_xml
 
 
 # Device and safety configuration.
-# REDMI K80（24117RK2CC）：屏幕 1440 x 3200，与旧设备 8595251f
-# （1440 x 3200）完全一致，坐标无需缩放，直接沿用。
+# REDMI K80（24117RK2CC）沿用 1440 x 3200 的标定坐标，无需缩放。
 # 注意：K80 默认处于 FHD+（Override 1080x2400），必须切到 WQHD+（1440x3200）
 # 预检才能通过，请先运行 tools\precheck_K80.py。
 # 设备序列号：留空 = 自动选择唯一一台已授权的 adb 设备；
 # 也可以用环境变量 DAMAI_DEVICE_SERIAL 指定（多台设备同时连接时必须指定）。
 DEVICE_SERIAL = ""
 EXPECTED_SCREEN_SIZE = (1440, 3200)
-# 使用项目目录内的官方 platform-tools（damai-main\platform-tools\adb.exe）。
-# 如果改成 None，脚本会回退为系统 PATH 里的 adb。
-ADB_PATH = Path(__file__).resolve().parent.parent / "platform-tools" / "adb.exe"
+# None 会按当前操作系统查找项目内 Platform-Tools 或 PATH，也可指定绝对路径。
+ADB_PATH = None
 DAMAI_PACKAGE = "cn.damai"
-ALIPAY_PACKAGE = "com.eg.android.AlipayGphone"
 
 # Calibrated/inferred tap points for 1440 x 3200 only.
 # MAIN_ACTION_POINT is inside all three proven bottom-right actions:
@@ -59,6 +60,7 @@ THREAD_JOIN_TIMEOUT_S = 3.0
 # 原状态机对同一弹窗只点一次，导致空等 30 秒。现在弹窗持续存在超过
 # RETRY_REPEAT_AFTER_S 秒就再点一次（只在探测到弹窗仍在时才点）。
 RETRY_REPEAT_AFTER_S = 1.0
+REFRESH_REPEAT_AFTER_S = 0.150  # 小米拥挤页「努力刷新」持续可点击时的重复间隔。
 # 选座页「确认选座」按钮的重复点击间隔（按钮不消失就再点）。
 SEAT_REPEAT_AFTER_S = 1.5
 # 同一弹窗持续存在时，自动保存界面层级 + 截图到 artifacts\，最多保存几份。
@@ -98,12 +100,15 @@ SOLD_OUT_CONFIRM_COUNT = 2
 RETRY_POINT_MAX_AGE_S = 1.0
 
 PAGE_RETRY_DIALOG = "retry_dialog"
+PAGE_REFRESH = "refresh_page"
+RETRY_PAGES = (PAGE_RETRY_DIALOG, PAGE_REFRESH)
 PAGE_SEAT_PAGE = "seat_page"
 PAGE_SOLD_OUT_DIALOG = "sold_out_dialog"
 PAGE_UNKNOWN_DIALOG = "unknown_dialog"
 PAGE_TERMINAL_DIALOG = "terminal_dialog"
 PAGE_ORDER_PAGE = "order_page"
 PAGE_ORDER_LOADING = "order_page_loading"
+PAGE_PURCHASE_TRANSITION = "purchase_transition"
 PAGE_RISK_VERIFICATION = "risk_verification"
 PAGE_DAMAI_OTHER = "damai_other"
 
@@ -181,7 +186,7 @@ class RuntimeState:
 
     def record_dialog(self, page: str) -> None:
         with self.lock:
-            if page == PAGE_RETRY_DIALOG:
+            if page in RETRY_PAGES:
                 self.retry_dialog_hits += 1
             elif page == PAGE_TERMINAL_DIALOG:
                 self.terminal_dialog_hits += 1
@@ -219,6 +224,9 @@ class RuntimeState:
 
     def finish(self, status: str, error: str | None = None) -> None:
         with self.lock:
+            # 支付宝已经出现时，其他线程稍晚返回的启动、超时或错误不能覆盖停机原因。
+            if self.status == "alipay_reached":
+                return
             self.status = status
             if error is not None:
                 self.worker_error = error
@@ -263,7 +271,11 @@ class StateDecision:
 class Mode0StateController:
     """Pure state machine for the post-submit retry loop."""
 
-    def __init__(self, clock: Callable[[], float] = time.perf_counter) -> None:
+    def __init__(self, clock: Callable[[], float] = time.perf_counter, *, continuous_main: bool = False,
+                 stop_on_verification: bool = False) -> None:
+        # 小米正常购票页只观察异常，订单加载和提交按钮不再阻塞固定点连点。
+        self.continuous_main = continuous_main
+        self.stop_on_verification = stop_on_verification
         self.phase = "blind"
         self.terminal_streak = 0
         self.clock = clock
@@ -283,7 +295,32 @@ class Mode0StateController:
         entered_risk = False
         left_risk = False
 
+        if self.continuous_main:
+            if page == "alipay_reached":
+                self.phase = "paused"
+                return StateDecision(previous, self.phase, status=page, clear_pending=True)
+            if page in (PAGE_DAMAI_OTHER, PAGE_ORDER_LOADING, PAGE_ORDER_PAGE, PAGE_PURCHASE_TRANSITION):
+                if previous == "risk_back_requested" and page == PAGE_DAMAI_OTHER:
+                    return StateDecision(previous, self.phase, clear_pending=True)
+                self.phase = "blind"
+                self.sold_out_streak = self.terminal_streak = 0
+                return StateDecision(previous, self.phase, clear_pending=previous != "blind",
+                                     left_risk=previous == "risk_back_requested")
+            if page == PAGE_TERMINAL_DIALOG:
+                self.phase = "await_result"
+            elif page not in RETRY_PAGES and page != PAGE_RISK_VERIFICATION:
+                # 未知页、读失败和选座都必须显式暂停，不能再靠主点位过期兜底。
+                if self.phase != "risk_back_requested":
+                    self.phase = "paused"
+                if page.startswith("probe_error"):
+                    return StateDecision(previous, self.phase, clear_pending=True)
+
         if page == PAGE_RISK_VERIFICATION:
+            if self.stop_on_verification:
+                # 固定入口在验证页结束，让用户在原页面接手。
+                self.phase = "paused"
+                return StateDecision(previous, self.phase, status="verification_required",
+                                     clear_pending=True, entered_risk=True)
             action = None
             if self.phase != "risk_back_requested":
                 self.phase = "risk_back_requested"
@@ -340,6 +377,7 @@ class Mode0StateController:
         if self.phase == "risk_back_requested":
             if page not in (
                 PAGE_RETRY_DIALOG,
+                PAGE_REFRESH,
                 PAGE_TERMINAL_DIALOG,
                 PAGE_ORDER_PAGE,
                 PAGE_ORDER_LOADING,
@@ -352,7 +390,7 @@ class Mode0StateController:
                 else "await_submit"
             )
 
-        if page == PAGE_RETRY_DIALOG:
+        if page in RETRY_PAGES:
             self.terminal_streak = 0
             now = self.clock()
             if self.phase != "retry_clicked":
@@ -362,14 +400,12 @@ class Mode0StateController:
                     previous,
                     self.phase,
                     action="retry",
-                    dialog_hit=PAGE_RETRY_DIALOG,
+                    dialog_hit=page,
                     left_risk=left_risk,
                 )
-            # 已点过「继续尝试」但弹窗仍在：超过 RETRY_REPEAT_AFTER_S 再点一次。
-            if (
-                self.last_retry_at is None
-                or now - self.last_retry_at >= RETRY_REPEAT_AFTER_S
-            ):
+            # 每次按当前可见按钮选择间隔，「继续尝试」仍需等满一秒。
+            interval = REFRESH_REPEAT_AFTER_S if page == PAGE_REFRESH else RETRY_REPEAT_AFTER_S
+            if self.last_retry_at is None or now >= self.last_retry_at + interval:
                 self.last_retry_at = now
                 self.retry_repeat_count += 1
                 return StateDecision(
@@ -428,15 +464,17 @@ class TapRequestQueue:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pending: str | None = None
+        self._restored = False
         self.changed = threading.Event()
 
     def request(self, action: str) -> bool:
         if action not in ("main", "submit", "retry", "back", "seat"):
             raise ValueError(f"未知点击动作：{action}")
         with self._lock:
-            if self._pending is not None:
+            if self._pending is not None and not self._restored:
                 return False
             self._pending = action
+            self._restored = False
             self.changed.set()
             return True
 
@@ -444,13 +482,23 @@ class TapRequestQueue:
         with self._lock:
             action = self._pending
             self._pending = None
+            self._restored = False
             self.changed.clear()
             return action
 
     def clear(self) -> None:
         with self._lock:
             self._pending = None
+            self._restored = False
             self.changed.clear()
+
+    def restore(self, action: str) -> None:
+        """坐标暂不可用时保留请求，让新产生的页面操作优先执行。"""
+        with self._lock:
+            if self._pending is None:
+                self._pending = action
+                self._restored = True
+                self.changed.set()
 
 
 class PersistentTapShell:
@@ -544,6 +592,8 @@ class PersistentQueryShell:
         package: str | None = None
         while True:
             line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError("ADB 前台查询通道已断开")
             if line.strip() == "__EOT__":
                 return package
             parsed = parse_foreground_package(line)
@@ -581,10 +631,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "sale_time",
+        nargs="?",
         type=parse_sale_time,
         help='Local start time, for example: "2026-08-18 13:00:00"',
     )
-    return parser.parse_args()
+    parser.add_argument("--from-detail", action="store_true", help="从当前小米详情页一次核对并启动")
+    parser.add_argument("--show", action="append", default=[], help="本场标题应包含的艺人或城市，可重复传入")
+    parser.add_argument("--at", help="本场预期开售时间，HH:MM（今天）或 YYYY-MM-DD HH:MM")
+    args = parser.parse_args()
+    if args.from_detail == (args.sale_time is not None):
+        parser.error("请使用 --from-detail 或提供开售日期时间，二选一")
+    if (args.show or args.at) and not args.from_detail:
+        parser.error("--show 和 --at 只能用于 --from-detail")
+    return args
 
 
 def make_schedule(
@@ -675,22 +734,28 @@ def classify_hierarchy_xml(xml_text: str) -> str:
 
 
 class RetryPointHolder:
-    """探测线程写入「继续尝试」按钮的实测中心点，点击线程只读取新鲜的点。"""
+    """在线程间传递新鲜点位；主按钮刚可用时，额外唤醒点击线程。"""
 
     def __init__(self, clock: Callable[[], float] = time.perf_counter) -> None:
         self._lock = threading.Lock()
         self._point: tuple[int, int] | None = None
         self._at = 0.0
         self.clock = clock
+        self.changed = threading.Event()
 
-    def set(self, point: tuple[int, int]) -> None:
+    def set(self, point: tuple[int, int], *, wake: bool = False) -> None:
+        """刷新点位有效期；仅首次可用或切换主页面时请求跳过连点节拍。"""
         with self._lock:
             self._point = point
             self._at = self.clock()
+            if wake:
+                self.changed.set()
 
     def clear(self) -> None:
+        """页面不可点击时，同时撤销尚未消费的唤醒信号。"""
         with self._lock:
             self._point = None
+            self.changed.clear()
 
     def fresh(self, max_age_s: float = RETRY_POINT_MAX_AGE_S) -> tuple[int, int] | None:
         with self._lock:
@@ -825,6 +890,107 @@ class FastPageProbe:
         return PAGE_SEAT_PAGE
 
 
+def visible_verification_prompt(device, reader) -> bool:
+    """小米 WebView 可能只暴露空节点；在暂停期间只读屏幕上方的公开提示。"""
+    from xiaomi_ui import has_frequency_verification
+
+    reader.start()  # 首次遇到未知页才启动，进程随本场运行关闭。
+    screen = device.screenshot()
+    width, height = screen.size
+    message_area = screen.crop((0, height // 6, width, height // 3))
+    lines = reader.read_lines(message_area)
+    if reader.error:
+        raise RuntimeError(f"验证提示识别失败：{reader.error}")
+    matched = has_frequency_verification("".join(lines))
+    if matched:
+        run_log.emit("verification_prompt_detected", source="screen_text", message="操作过于频繁，完成验证后可继续购票")
+    return matched
+
+
+class XiaomiPageProbe:
+    """后台读取 XML 判断是否允许点固定主按钮，兼容 selector.exists 的假阴性。"""
+
+    def __init__(self, device: object) -> None:
+        self.device = device
+        self.screen_size = SCREEN_SIZES[XIAOMI_15_MODEL]
+        self.main_points = RetryPointHolder()
+        self.submit_points = RetryPointHolder()
+        self.retry_points = RetryPointHolder()
+        self.seat_points = RetryPointHolder()
+        self.last_dialog_text = ""
+        self.last_xml = ""
+        self.last_observation: tuple[object, ...] | None = None
+
+    def read(self, phase: str) -> str:
+        """缓存实测点；已知正常转场延续连点，未知页/遮挡/读取失败仍暂停。"""
+        started = time.perf_counter()
+        previous_xml = self.last_xml
+        self.last_xml = ""
+        try:
+            self.last_xml = self.device.dump_hierarchy()
+            # 完整 XML 已包含尺寸证据时省去两次 ADB 往返；弹窗等缺证据时仍实查。
+            if not screen_size_matches_xml(self.last_xml, self.screen_size) and tuple(
+                self.device.window_size()
+            ) != self.screen_size:
+                raise RuntimeError("手机屏幕尺寸发生变化，请恢复竖屏并重新预检")
+            page, point = parse_page(self.last_xml, self.screen_size)
+            if page == PAGE_PURCHASE_TRANSITION and not (
+                phase == "blind" and self.last_observation is not None
+                and self.last_observation[0] in (
+                    PAGE_DAMAI_OTHER, PAGE_ORDER_LOADING, PAGE_ORDER_PAGE, PAGE_PURCHASE_TRANSITION
+                )
+            ):
+                # 空树不能证明已进入购票流程，也不能解除此前的异常暂停。
+                page = PAGE_UNKNOWN_DIALOG
+            if page == PAGE_DAMAI_OTHER and point is None:
+                page = PAGE_UNKNOWN_DIALOG
+        except Exception as exc:
+            self.main_points.clear()
+            self.submit_points.clear()
+            self.retry_points.clear()
+            self.seat_points.clear()
+            run_log.emit(
+                "page_probe_failed", phase=phase, error_type=type(exc).__name__, error=str(exc),
+                duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                xml_text=self.last_xml or None,
+            )
+            raise
+        # 复用这一帧 XML 留证，不为日志再次读取手机；详情和票档虽同状态，也单独记录。
+        stage = page
+        if page == PAGE_DAMAI_OTHER:
+            if 'resource-id="cn.damai:id/btn_buy_view"' in self.last_xml:
+                stage = "ticket_panel"
+            elif 'resource-id="cn.damai:id/trade_project_detail_purchase_status_bar_container_fl"' in self.last_xml:
+                stage = "detail"
+        observation = (page, stage, point)
+        holder = None
+        if point is not None:
+            holder = self.main_points
+            if page == PAGE_ORDER_PAGE:
+                holder = self.submit_points
+            elif page in RETRY_PAGES:
+                holder = self.retry_points
+            elif page == PAGE_SEAT_PAGE:
+                holder = self.seat_points
+        for cached in (self.main_points, self.submit_points, self.retry_points, self.seat_points):
+            if cached is not holder:
+                cached.clear()
+        if holder is not None:
+            # 同一帧只续期；新主页面立即唤醒，避免购买/确认额外等待 150 ms 节拍。
+            wake = holder is self.main_points and phase == "blind" and (
+                observation != self.last_observation or holder.fresh() is None
+            )
+            holder.set(point, wake=wake)
+        run_log.emit(
+            "page_probe", page=page, stage=stage, phase=phase, allowed_point=point,
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            # 同属 unknown 的空窗、WebView 和验证页也要保留内容变化，不额外读取手机。
+            xml_text=self.last_xml if observation != self.last_observation or self.last_xml != previous_xml else None,
+        )
+        self.last_observation = observation
+        return page
+
+
 def summarize_bottom_controls(
     xml_text: str,
     screen_height: int = EXPECTED_SCREEN_SIZE[1],
@@ -854,7 +1020,7 @@ def summarize_bottom_controls(
 
 
 class DiagnosticProbe:
-    """K80 专用：包装 FastPageProbe，增加 heartbeat 日志和弹窗卡住时的现场快照。
+    """包装页面探测，增加 heartbeat 日志和弹窗卡住时的现场快照。
 
     不改变探测结果，也不发出任何点击；只读 + 写 artifacts\\ 文件。
     快照在后台线程里做，不阻塞探测/重试闭环。
@@ -872,6 +1038,8 @@ class DiagnosticProbe:
         self.dialog_snapshots = 0
         self._snapshot_thread: threading.Thread | None = None
         self._snapshot_due_at: float | None = None
+        self._last_unknown_snapshot_at: float | None = None
+        self._last_snapshot_skip: tuple[str, str] | None = None
         self._lock = threading.Lock()
 
     def read(self, phase: str) -> str:
@@ -890,8 +1058,9 @@ class DiagnosticProbe:
                     }
                 )
                 self._start_snapshot(page, 0.0)  # 新类型弹窗立即留证
-                self._snapshot_due_at = None
-            elif page == PAGE_RETRY_DIALOG:
+                # 小米 WebView 验证往往一直归为 unknown，不能等分类变化才补图。
+                self._snapshot_due_at = now + 5.0 if isinstance(self.inner, XiaomiPageProbe) and page == PAGE_UNKNOWN_DIALOG else None
+            elif page in RETRY_PAGES:
                 self._snapshot_due_at = now + RETRY_REPEAT_AFTER_S
             elif page in STUCK_SNAPSHOT_PAGES and now >= self.sale_monotonic:
                 self._snapshot_due_at = now + STUCK_PAGE_SNAPSHOT_AFTER_S
@@ -921,26 +1090,41 @@ class DiagnosticProbe:
             self._snapshot_due_at = now
         if self._snapshot_due_at is not None and now >= self._snapshot_due_at:
             # 同一页面持续卡住时，每 2 秒（弹窗）/ 5 秒（非弹窗）最多再存一份
-            self._snapshot_due_at = now + (2.0 if page == PAGE_RETRY_DIALOG else 5.0)
+            self._snapshot_due_at = now + (2.0 if page in RETRY_PAGES else 5.0)
             self._start_snapshot(page, stuck_for)
         return page
 
     def _emit(self, record: dict[str, object]) -> None:
+        run_log.emit(str(record["event"]), **{key: value for key, value in record.items() if key != "event"})
         record["wall_time"] = datetime.now().astimezone().isoformat(timespec="milliseconds")
         record["seconds_after_sale"] = round(time.perf_counter() - self.sale_monotonic, 3)
         print(json.dumps(record, ensure_ascii=False), flush=True)
 
     def _start_snapshot(self, page: str, stuck_for: float) -> None:
+        """异步截图保持单任务；小米持续未知页每五秒可补图，避免三张额度提前耗尽。"""
         with self._lock:
+            now = time.perf_counter()
+            repeat_unknown = isinstance(self.inner, XiaomiPageProbe) and page == PAGE_UNKNOWN_DIALOG
+            reason = None
             # 弹窗现场与非弹窗卡页现场分别计数，互不挤占名额。
             is_stuck_page = page in STUCK_SNAPSHOT_PAGES
-            if is_stuck_page:
-                if self.stuck_page_snapshots >= STUCK_PAGE_SNAPSHOT_LIMIT:
-                    return
-            elif self.dialog_snapshots >= DIALOG_SNAPSHOT_LIMIT:
+            if is_stuck_page and self.stuck_page_snapshots >= STUCK_PAGE_SNAPSHOT_LIMIT:
+                reason = "stuck_page_limit"
+            elif not is_stuck_page and not repeat_unknown and self.dialog_snapshots >= DIALOG_SNAPSHOT_LIMIT:
+                reason = "dialog_limit"
+            elif repeat_unknown and self._last_unknown_snapshot_at is not None and now - self._last_unknown_snapshot_at < 5.0:
+                reason = "capture_interval"
+            elif self._snapshot_thread is not None and self._snapshot_thread.is_alive():
+                reason = "capture_busy"
+            if reason is not None:
+                # 高频页面跳变只记录一次相同跳过原因，不能让诊断日志占满点击热路径。
+                if self._last_snapshot_skip != (page, reason):
+                    run_log.emit("snapshot_skipped", page=page, reason=reason)
+                    self._last_snapshot_skip = (page, reason)
                 return
-            if self._snapshot_thread is not None and self._snapshot_thread.is_alive():
-                return
+            self._last_snapshot_skip = None
+            if repeat_unknown:
+                self._last_unknown_snapshot_at = now
             if is_stuck_page:
                 self.stuck_page_snapshots += 1
             else:
@@ -948,26 +1132,33 @@ class DiagnosticProbe:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             base = ARTIFACTS_DIR / f"stuck_{page}_{stamp}"
             self.snapshots.append(str(base))
+            run_log.emit("snapshot_started", page=page, base=str(base), requested_monotonic=now,
+                         xml_reused=bool(getattr(self.inner, "last_xml", None)))
             self._snapshot_thread = threading.Thread(
                 target=self._snapshot,
-                args=(base, page, stuck_for),
+                args=(base, page, stuck_for, getattr(self.inner, "last_xml", None)),
                 name="damai-k80-snapshot",
                 daemon=True,
             )
             self._snapshot_thread.start()
 
-    def _snapshot(self, base: Path, page: str, stuck_for: float) -> None:
+    def _snapshot(self, base: Path, page: str, stuck_for: float, xml_text: str | None = None) -> None:
+        """小米复用触发快照时的 XML；截图稍后采集，时间可能与 XML 有差异。"""
+        started = time.perf_counter()
+        screenshot_started = None
         saved: list[str] = []
         error = None
         bottom: list[dict[str, object]] = []
         try:
             ARTIFACTS_DIR.mkdir(exist_ok=True)
-            xml_text = self.device.dump_hierarchy()
+            xml_text = xml_text or self.device.dump_hierarchy()
             xml_path = base.with_suffix(".xml")
             xml_path.write_text(xml_text, encoding="utf-8")
             saved.append(xml_path.name)
-            bottom = summarize_bottom_controls(xml_text)
+            screen_size = getattr(self.inner, "screen_size", EXPECTED_SCREEN_SIZE)
+            bottom = summarize_bottom_controls(xml_text, screen_height=screen_size[1])
             png_path = base.with_suffix(".png")
+            screenshot_started = time.perf_counter()
             self.device.screenshot(str(png_path))
             saved.append(png_path.name)
         except Exception as exc:  # 快照失败不影响抢票
@@ -979,6 +1170,8 @@ class DiagnosticProbe:
                 "same_page_seconds": round(stuck_for, 3),
                 "files": saved,
                 "bottom_controls": bottom,
+                "capture_started_monotonic": screenshot_started,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
                 "error": error,
             }
         )
@@ -987,6 +1180,8 @@ class DiagnosticProbe:
         thread = self._snapshot_thread
         if thread is not None:
             thread.join(timeout=timeout)
+            if thread.is_alive():
+                run_log.emit("snapshot_incomplete", reason="capture_still_running_at_shutdown")
 
 
 def wait_until(target: float, stop_event: threading.Event) -> bool:
@@ -1004,58 +1199,134 @@ def tap_loop(
     stop_event: threading.Event,
     controlled_event: threading.Event,
     requests: TapRequestQueue,
-    tap_shell: PersistentTapShell,
+    tap_shell: PersistentTapShell | ScopedInput,
     query_shell: PersistentQueryShell,
     retry_points: RetryPointHolder | None = None,
     seat_points: RetryPointHolder | None = None,
+    main_points: RetryPointHolder | None = None,
+    submit_points: RetryPointHolder | None = None,
+    continuous_main_point: tuple[int, int] | None = None,
+    purchase_ready: threading.Event | None = None,
 ) -> None:
-    try:
-        if not wait_until(schedule.click_start_monotonic, stop_event):
-            return
+    """等待首击信号后发送输入；小米主流程不等点位续期，异常由后台接管。"""
+    last_package = None
+    wait_reason = None
+    wait_started = 0.0
 
-        next_blind_tap = max(schedule.click_start_monotonic, time.perf_counter())
+    def record_wait(reason: str | None) -> None:
+        """只记录等待原因的变化，避免每轮空等都产生重复日志。"""
+        nonlocal wait_reason, wait_started
+        if reason == wait_reason:
+            return
+        now = time.perf_counter()
+        if wait_reason is not None:
+            run_log.emit("click_wait_end", reason=wait_reason, duration_ms=round((now - wait_started) * 1000, 3))
+        wait_reason, wait_started = reason, now
+        if reason is not None:
+            run_log.emit("click_wait_start", reason=reason)
+
+    def may_dispatch(action: str) -> bool:
+        """查询和选动作期间可能收到停止信号；紧邻输入发送复查，不增加 ADB 往返。"""
+        if stop_event.is_set():
+            return False
+        if time.perf_counter() >= schedule.deadline_monotonic:
+            state.finish("timeout")
+            run_log.emit("stop_requested", reason="timeout")
+            stop_event.set()
+            return False
+        if action == "main" and controlled_event.is_set():
+            record_wait("main_paused")
+            return False
+        return True
+
+    try:
+        if purchase_ready is None:
+            if not wait_until(schedule.click_start_monotonic, stop_event):
+                return
+        else:
+            # 图像线程只负责首击放行；文字提前变更也立即响应，不再等 Mac 到点。
+            while not purchase_ready.wait(.01):
+                if stop_event.is_set():
+                    return
+                if time.perf_counter() >= schedule.deadline_monotonic:
+                    state.finish("timeout")
+                    stop_event.set()
+                    return
+            if stop_event.is_set():
+                return
+
+        next_blind_tap = time.perf_counter() if purchase_ready is not None else max(
+            schedule.click_start_monotonic, time.perf_counter()
+        )
         state.finish("clicking")
+        scoped = isinstance(tap_shell, ScopedInput)
+        first_ready = purchase_ready is not None and continuous_main_point is not None and scoped
         while not stop_event.is_set():
             now = time.perf_counter()
             if now >= schedule.deadline_monotonic:
                 state.finish("timeout")
+                run_log.emit("stop_requested", reason="timeout")
                 stop_event.set()
                 return
 
-            try:
-                package = query_shell.query_package()
-            except Exception:
-                # A failed foreground check means no coordinate tap is safe.
-                state.record_foreground_error()
-                stop_event.wait(0.01)
-                continue
-            if package is None:
-                # Unparseable foreground means unknown: still no tap.
-                state.record_foreground_error()
-                stop_event.wait(0.01)
-                continue
+            # 首次看到可购文案时，Android 已在投递端绑定大麦 UID；暂停和排队动作仍走常规检查。
+            direct_main = first_ready and not controlled_event.is_set() and not requests.changed.is_set()
+            first_ready = False
+            query_started = query_finished = query_ms = None
+            if not direct_main:
+                try:
+                    query_started = time.perf_counter()
+                    package = query_shell.query_package()
+                    query_finished = time.perf_counter()
+                    query_ms = round((query_finished - query_started) * 1000, 3)
+                except Exception as exc:
+                    # A failed foreground check means no coordinate tap is safe.
+                    state.record_foreground_error()
+                    record_wait(f"foreground_query_error:{type(exc).__name__}:{exc}")
+                    stop_event.wait(0.01)
+                    continue
+                if package is None:
+                    # Unparseable foreground means unknown: still no tap.
+                    state.record_foreground_error()
+                    record_wait("foreground_unknown")
+                    stop_event.wait(0.01)
+                    continue
 
-            state.update_package(package)
-            if package == ALIPAY_PACKAGE:
-                requests.clear()
-                state.finish("alipay_reached")
-                stop_event.set()
-                return
-            if package != DAMAI_PACKAGE:
-                stop_event.wait(0.01)
-                continue
+                state.update_package(package)
+                if package != last_package:
+                    run_log.emit("foreground_changed", previous=last_package, package=package, query_ms=query_ms)
+                    last_package = package
+                if package == ALIPAY_PACKAGE:
+                    requests.clear()
+                    state.finish("alipay_reached")
+                    run_log.emit("stop_requested", reason="alipay_reached")
+                    stop_event.set()
+                    return
+                if package != DAMAI_PACKAGE:
+                    record_wait(f"foreground_other:{package}")
+                    stop_event.wait(0.01)
+                    continue
 
-            action = requests.pop()
+            action = None if direct_main else requests.pop()
             now = time.perf_counter()
-            if action is None and not controlled_event.is_set() and now >= next_blind_tap:
-                action = "main"
-                next_blind_tap += CLICK_INTERVAL_S
-                if next_blind_tap <= now:
-                    next_blind_tap = now + CLICK_INTERVAL_S
+            if action is None and not controlled_event.is_set():
+                immediate = continuous_main_point is None and main_points is not None and main_points.changed.is_set()
+                if immediate or now >= next_blind_tap:
+                    action = "main"
+                    if main_points is not None:
+                        main_points.changed.clear()
+                    # 新页面首击立即执行，后续连点从本次首击重新计时，避免紧接着补一击。
+                    next_blind_tap = now + CLICK_INTERVAL_S if immediate else next_blind_tap + CLICK_INTERVAL_S
+                    if next_blind_tap <= now:
+                        next_blind_tap = now + CLICK_INTERVAL_S
 
             if action is not None:
                 if action == "back":
+                    record_wait(None)
+                    if not may_dispatch(action):
+                        continue
                     tap_shell.back()
+                    run_log.emit("input_dispatched", action=action, query_ms=query_ms, page=state.last_page)
                     state.record_risk_back()
                     continue
                 retry = action == "retry"
@@ -1064,8 +1335,13 @@ def tap_loop(
                     point = seat_points.fresh() if seat_points is not None else None
                     if point is None:
                         state.record_skipped_seat()
+                        record_wait("seat_point_unavailable")
+                        continue
+                    record_wait(None)
+                    if not may_dispatch(action):
                         continue
                     tap_shell.tap(point)
+                    run_log.emit("input_dispatched", action=action, point=point, query_ms=query_ms, page=state.last_page)
                     state.record_seat_tap()
                     continue
                 if retry:
@@ -1073,20 +1349,61 @@ def tap_loop(
                     point = retry_points.fresh() if retry_points is not None else None
                     if point is None:
                         state.record_skipped_retry()
+                        record_wait("retry_point_unavailable")
                         continue
                 else:
-                    point = MAIN_ACTION_POINT
+                    # 小米主流程直用固定坐标；异常暂停由 controlled_event 独立控制。
+                    holder = submit_points if action == "submit" else main_points
+                    point = continuous_main_point if continuous_main_point is not None else (
+                        holder.fresh() if holder is not None else MAIN_ACTION_POINT
+                    )
+                    if point is None:
+                        record_wait(f"{action}_point_unavailable_or_stale")
+                        if action == "submit":
+                            requests.restore(action)
+                        stop_event.wait(0.01)
+                        continue
+                record_wait(None)
+                if not may_dispatch(action):
+                    continue
+                dispatch_started = time.perf_counter()
                 tap_shell.tap(point)
+                dispatch_finished = time.perf_counter()
+                # 小米的结束时间包含 Android 分发回执；业务页面完成响应要看后续记录。
+                run_log.emit("input_dispatched", action=action, point=point, query_ms=query_ms, page=state.last_page,
+                             input_guard="android_target_uid" if scoped else "foreground_query",
+                             query_started_monotonic=query_started, query_finished_monotonic=query_finished,
+                             dispatch_started_monotonic=dispatch_started,
+                             dispatch_finished_monotonic=dispatch_finished)
                 state.record_tap(retry=retry)
                 continue
 
             if controlled_event.is_set():
                 requests.changed.wait(0.01)
             else:
-                stop_event.wait(min(max(next_blind_tap - now, 0.0), 0.01))
+                wake_event = main_points.changed if main_points is not None else stop_event
+                wake_event.wait(min(max(next_blind_tap - now, 0.0), 0.01))
+    except TargetMismatch:
+        # 查前台只用来说明停机原因。先停输入，确保查询慢或失败也不会重试。
+        state.finish("input_target_mismatch")
+        stop_event.set()
+        requests.clear()
+        package = None
+        try:
+            package = query_shell.query_package()
+        except Exception:
+            state.record_foreground_error()
+        if package:
+            state.update_package(package)
+        reason = "alipay_reached" if package == ALIPAY_PACKAGE else "input_target_mismatch"
+        state.finish(reason)
+        run_log.emit("stop_requested", reason=reason, input_guard="android_target_uid", package=package)
     except BaseException as exc:
         state.finish("error", f"{type(exc).__name__}: {exc}")
+        run_log.emit("worker_error", error_type=type(exc).__name__, error=str(exc))
         stop_event.set()
+    finally:
+        record_wait(None)
 
 
 def query_foreground_once(adb_path: Path) -> str | None:
@@ -1119,34 +1436,30 @@ def query_foreground_once(adb_path: Path) -> str | None:
     return None
 
 
-def validate_preflight(device: object, adb_path: Path) -> None:
+def validate_preflight(device: object, adb_path: Path) -> str:
+    """按实际机型校验屏幕与前台，返回后才能创建点击线程。"""
+    model = device.shell("getprop ro.product.model").output.strip()
+    expected = SCREEN_SIZES.get(model, EXPECTED_SCREEN_SIZE)
     actual_size = tuple(device.window_size())
-    if actual_size != EXPECTED_SCREEN_SIZE:
+    if actual_size != expected:
         raise RuntimeError(
             f"手机分辨率为 {actual_size[0]}×{actual_size[1]}，"
-            f"但模式 0 坐标按 {EXPECTED_SCREEN_SIZE[0]}×{EXPECTED_SCREEN_SIZE[1]} 校准。"
-            "K80 请在 设置 → 显示与亮度 → 屏幕分辨率 中选择 WQHD+"
+            f"但机型 {model} 需要 {expected[0]}×{expected[1]}，请检查分辨率与竖屏方向。"
         )
     current_package = query_foreground_once(adb_path)
     if current_package != DAMAI_PACKAGE:
         raise RuntimeError(
             f"当前前台为 {current_package or '未知'}，请先将大麦置于前台并停在目标演唱会详情页"
         )
+    return model
 
 
 def resolve_adb() -> Path:
-    """Resolve the adb executable: explicit ADB_PATH first, then PATH lookup."""
-    if ADB_PATH is not None:
-        if not ADB_PATH.is_file():
-            raise FileNotFoundError(f"ADB 不存在：{ADB_PATH}")
-        return ADB_PATH
-    found = shutil.which("adb")
-    if not found:
-        raise FileNotFoundError(
-            "ADB_PATH 为 None 且系统 PATH 中找不到 adb，"
-            "请设置 ADB_PATH 为本机 adb.exe 的绝对路径"
-        )
-    return Path(found)
+    """使用显式路径或当前系统的 adb，保持 Mac 与预检工具的解析一致。"""
+    path = ADB_PATH if ADB_PATH is not None else default_adb_path()
+    if not path.is_file():
+        raise FileNotFoundError(f"ADB 不存在：{path}，请安装 Android Platform-Tools")
+    return path
 
 
 def resolve_serial(adb_path: Path) -> str:
@@ -1177,17 +1490,63 @@ def resolve_serial(adb_path: Path) -> str:
     return ready[0]
 
 
-def run(sale_time: datetime) -> dict[str, object]:
+def capture_boundary(device: object, label: str, xml_text: str | None = None) -> None:
+    """仅在点击开始前或停止后采集截图和 XML，采集失败不会改变购票结果。"""
+    recorder = run_log.active
+    if recorder is None:
+        return
+    started = time.perf_counter()
+    errors = []
+    png_path = recorder.directory / f"{label}.png"
+    if xml_text is None:
+        try:
+            xml_text = device.dump_hierarchy()
+        except Exception as exc:
+            errors.append(f"XML: {type(exc).__name__}: {exc}")
+    try:
+        device.screenshot(str(png_path))
+    except Exception as exc:
+        errors.append(f"PNG: {type(exc).__name__}: {exc}")
+    run_log.emit(
+        "boundary_capture", label=label, xml_text=xml_text,
+        png_path=png_path.name if png_path.is_file() else None,
+        errors=errors, duration_ms=round((time.perf_counter() - started) * 1000, 3),
+    )
+
+
+@dataclass(frozen=True)
+class CheckedDetail:
+    """把核对过的设备和页面交给正式流程，避免重新选设备或再抓一次详情页。"""
+    serial: str
+    device: object
+    xml: str
+    title: str
+
+
+def run(sale_time: datetime, detail: CheckedDetail | None = None) -> dict[str, object]:
+    """小米以购买文案放行首击，之后固定点连续点击；支付宝出现即停。"""
     global DEVICE_SERIAL
     adb_path = resolve_adb()
-    DEVICE_SERIAL = resolve_serial(adb_path)
-
-    probe_device = u2.connect(DEVICE_SERIAL)
-    validate_preflight(probe_device, adb_path)
+    DEVICE_SERIAL = detail.serial if detail else resolve_serial(adb_path)
+    probe_device = detail.device if detail else u2.connect(DEVICE_SERIAL)
+    model = validate_preflight(probe_device, adb_path)
+    if detail and model != XIAOMI_15_MODEL:
+        raise RuntimeError("详情页启动入口仅适配小米 15")
     schedule = make_schedule(sale_time, datetime.now(), time.perf_counter())
+    if model == XIAOMI_15_MODEL:
+        # Mac 时间只保留作日志和截止时间；首击等待按钮真正出现可购买文案。
+        schedule = replace(
+            schedule, click_start_monotonic=schedule.sale_monotonic,
+            first_probe_monotonic=time.perf_counter(),
+        )
     retry_points = RetryPointHolder()
+    inner_probe = (
+        XiaomiPageProbe(probe_device) if model == XIAOMI_15_MODEL
+        else FastPageProbe(probe_device, retry_points)
+    )
+    retry_points = inner_probe.retry_points
     page_probe = DiagnosticProbe(
-        FastPageProbe(probe_device, retry_points),
+        inner_probe,
         probe_device,
         schedule.sale_monotonic,
     )
@@ -1198,13 +1557,46 @@ def run(sale_time: datetime) -> dict[str, object]:
             "safety": "no_tap_dispatched",
         }
 
+    run_log.emit(
+        "device_ready", serial=DEVICE_SERIAL, model=model,
+        screen_size=SCREEN_SIZES.get(model, EXPECTED_SCREEN_SIZE),
+        main_action_point=XIAOMI_15_MAIN_ACTION_POINT if model == XIAOMI_15_MODEL else MAIN_ACTION_POINT,
+        click_start_monotonic=schedule.click_start_monotonic,
+        first_probe_monotonic=schedule.first_probe_monotonic,
+        start_trigger="purchase_button_text" if model == XIAOMI_15_MODEL else "preclick",
+        input_backend="android_target_uid" if model == XIAOMI_15_MODEL else "adb_shell",
+        continuous_main=model == XIAOMI_15_MODEL,
+    )
+    # 临近开抢直接跳过开场截图，避免采集挤占首击准备时间。
+    if schedule.click_start_monotonic - time.perf_counter() >= 10:
+        capture_boundary(probe_device, "initial", detail.xml if detail else None)
+    else:
+        run_log.emit("boundary_capture_skipped", label="initial", reason="less_than_10_seconds_before_clicking")
+
     state = RuntimeState()
     stop_event = threading.Event()
     controlled_event = threading.Event()
     requests = TapRequestQueue()
-    controller = Mode0StateController()
-    tap_shell = PersistentTapShell(adb_path, DEVICE_SERIAL)
+    controller = Mode0StateController(continuous_main=model == XIAOMI_15_MODEL, stop_on_verification=model == XIAOMI_15_MODEL)
+    purchase_ready = threading.Event() if model == XIAOMI_15_MODEL else None
+    button_worker = None
+    verification_reader = None
+    if model == XIAOMI_15_MODEL:
+        from button_text import ButtonTextReader
+        verification_reader = ButtonTextReader(stop_event)
+        # 首次后台读取完成前不盲点未知页面；后续正常切页不再等待逐页许可。
+        controlled_event.set()
     query_shell = PersistentQueryShell(adb_path, DEVICE_SERIAL)
+    try:
+        if model == XIAOMI_15_MODEL:
+            # 预检已确认大麦在前台，开售前将触摸通道绑定到它独占的 Android UID。
+            tap_shell = ScopedInput(adb_path, DEVICE_SERIAL)
+            run_log.emit("input_target_ready", package=DAMAI_PACKAGE, uid=tap_shell.uid)
+        else:
+            tap_shell = PersistentTapShell(adb_path, DEVICE_SERIAL)
+    except BaseException:
+        query_shell.close()
+        raise
     worker = threading.Thread(
         target=tap_loop,
         args=(
@@ -1217,13 +1609,26 @@ def run(sale_time: datetime) -> dict[str, object]:
             query_shell,
             retry_points,
             page_probe.inner.seat_points,
+            getattr(inner_probe, "main_points", None),
+            getattr(inner_probe, "submit_points", None),
+            XIAOMI_15_MAIN_ACTION_POINT if model == XIAOMI_15_MODEL else None,
+            purchase_ready,
         ),
         name="damai-mode0-k80-tap-loop",
         daemon=True,
     )
-    worker.start()
-
     try:
+        worker.start()
+        if purchase_ready is not None:
+            from button_ready import watch_purchase_button
+            button_worker = threading.Thread(
+                target=watch_purchase_button,
+                args=(u2.connect(DEVICE_SERIAL), adb_path, DEVICE_SERIAL, purchase_ready,
+                      stop_event, state, schedule.deadline_monotonic),
+                kwargs={"initial_xml": detail.xml} if detail else {},
+                name="damai-purchase-button", daemon=False,
+            )
+            button_worker.start()
         run_tail_probe_loop(
             schedule=schedule,
             state=state,
@@ -1235,15 +1640,35 @@ def run(sale_time: datetime) -> dict[str, object]:
             wait_until=wait_until,
             state_check_interval_s=STATE_CHECK_INTERVAL_S,
             risk_state_check_interval_s=RISK_STATE_CHECK_INTERVAL_S,
+            purchase_ready=purchase_ready,
+            check_unknown_verification=(lambda: visible_verification_prompt(probe_device, verification_reader))
+            if verification_reader is not None else None,
         )
+    except BaseException as exc:
+        run_log.emit("stop_requested", reason="interrupted" if isinstance(exc, KeyboardInterrupt) else "probe_loop_error")
+        raise
     finally:
         requests.clear()
         state.leave_risk_wait(time.perf_counter())
         stop_event.set()
-        worker.join(timeout=THREAD_JOIN_TIMEOUT_S)
-        page_probe.join(timeout=THREAD_JOIN_TIMEOUT_S)
-        tap_shell.close()
-        query_shell.close()
+        try:
+            if verification_reader is not None:
+                verification_reader.close()
+            if worker.ident is not None:
+                worker.join(timeout=THREAD_JOIN_TIMEOUT_S)
+            if button_worker is not None and button_worker.ident is not None:
+                # 采集持有手机 server/forward；必须等有超时的清理完成再退出。
+                button_worker.join()
+            page_probe.join(timeout=THREAD_JOIN_TIMEOUT_S)
+        finally:
+            try:
+                tap_shell.close()
+            finally:
+                query_shell.close()
+        # 收尾截图的耗时不能计入抢票结束时间，否则会误判流程速度。
+        finished_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        finished_monotonic = time.perf_counter()
+        capture_boundary(probe_device, "final")
 
     result = state.snapshot()
     result.update(
@@ -1258,22 +1683,20 @@ def run(sale_time: datetime) -> dict[str, object]:
             "unknown_dialog_hits": controller.unknown_dialog_hits,
             "dialog_snapshots": page_probe.snapshots,
             "sale_time": sale_time.isoformat(sep=" "),
-            "finished_at": datetime.now().astimezone().isoformat(
-                timespec="milliseconds"
-            ),
+            "finished_at": finished_at,
             "seconds_after_sale": round(
-                time.perf_counter() - schedule.sale_monotonic,
+                finished_monotonic - schedule.sale_monotonic,
                 3,
             ),
-            "main_action_point": list(MAIN_ACTION_POINT),
+            "main_action_point": list(XIAOMI_15_MAIN_ACTION_POINT if model == XIAOMI_15_MODEL else MAIN_ACTION_POINT),
             "retry_dialog_point": "measured_from_retry_button_bounds",
             "safety": (
                 "stops_on_alipay_foreground_or_terminal_or_sold_out_dialog; "
                 "clicks_seat_confirm_when_on_seat_page; "
-                "clicks_retry_only_when_button_text_is_继续尝试; "
+                "clicks_retry_only_when_button_text_is_继续尝试_or_努力刷新; "
                 "never_clicks_unknown_dialog; "
-                "backs_once_from_risk_verification; "
-                "never_clicks_alipay_pay; never_clicks_back_redirect"
+                + ("stops_on_risk_verification; " if controller.stop_on_verification else "backs_once_from_risk_verification; ")
+                + "never_clicks_alipay_pay; never_clicks_back_redirect"
             ),
         }
     )
@@ -1281,11 +1704,64 @@ def run(sale_time: datetime) -> dict[str, object]:
 
 
 def main() -> None:
+    """每次手动启动都自动归档记录；成功、异常和 Ctrl-C 均尽量留下最终结果。"""
+    global ARTIFACTS_DIR
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     args = parse_args()
-    result = run(args.sale_time)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    detail = None
+    sale_time = args.sale_time
+    if sale_time is None:
+        from sale_detail import check_sale_detail
+        serial = resolve_serial(resolve_adb())
+        device = u2.connect(serial)
+        xml = device.dump_hierarchy()
+        try:
+            title, sale_time = check_sale_detail(xml, args.show, args.at, datetime.now())
+        except ValueError as exc:
+            raise SystemExit(f"未启动：{exc}") from None
+        detail = CheckedDetail(serial, device, xml, title)
+    original_dir = ARTIFACTS_DIR
+    directory = original_dir / f"run_{datetime.now():%Y%m%d_%H%M%S_%f}"
+    recorder = run_log.RunLog(directory, sale_time)
+    run_log.active = recorder
+    ARTIFACTS_DIR = directory
+    result = {"status": "initialization_error"}
+    try:
+        with recorder.capture_console():
+            print(f"实战记录目录：{directory}", flush=True)
+            recorder.emit(
+                "run_started", sale_time=sale_time.isoformat(), python=sys.version,
+                click_interval_s=CLICK_INTERVAL_S,
+                max_runtime_after_sale_s=MAX_RUNTIME_AFTER_SALE_S,
+            )
+            try:
+                if detail:
+                    print(f"核对通过：{detail.title}，{sale_time:%Y-%m-%d %H:%M} 开抢，预填已完成。正在启动。", flush=True)
+                    recorder.emit("sale_detail_confirmed", title=detail.title, sale_time=sale_time.isoformat(),
+                                  prefill="已完成", serial=detail.serial)
+                    result = run(sale_time, detail)
+                else:
+                    result = run(sale_time)
+            except BaseException as exc:
+                result = {
+                    "status": "interrupted" if isinstance(exc, KeyboardInterrupt) else "error",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                }
+                recorder.emit("run_error", **result)
+                traceback.print_exc()
+                raise
+            finally:
+                recorder.emit("run_finished", status=result["status"])
+                recorder.close()
+                result["recording_directory"] = str(directory)
+                result["recording_errors"] = list(recorder.errors)
+                recorder.write_result(result)
+                print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    finally:
+        run_log.active = None
+        ARTIFACTS_DIR = original_dir
+        recorder.close()
 
 
 if __name__ == "__main__":

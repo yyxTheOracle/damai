@@ -5,6 +5,8 @@ import json
 import time
 from typing import Callable
 
+import run_log
+
 
 def run_tail_probe_loop(
     *,
@@ -18,6 +20,8 @@ def run_tail_probe_loop(
     wait_until: Callable[[float, object], bool],
     state_check_interval_s: float,
     risk_state_check_interval_s: float,
+    purchase_ready: object | None = None,
+    check_unknown_verification: Callable[[], bool] | None = None,
 ) -> None:
     """Run the shared Android order-page/retry state machine.
 
@@ -31,6 +35,7 @@ def run_tail_probe_loop(
         if now >= schedule.deadline_monotonic:
             requests.clear()
             state.finish("timeout")
+            run_log.emit("stop_requested", reason="timeout")
             stop_event.set()
             break
         if not wait_until(next_probe, stop_event):
@@ -38,10 +43,39 @@ def run_tail_probe_loop(
 
         try:
             page = page_probe.read(controller.phase)
+            if page == "unknown_dialog" and check_unknown_verification is not None:
+                # 先暂停输入并清空旧动作，再读可见提示；检查返回前不能因页面跳转恢复。
+                controlled_event.set()
+                requests.clear()
+                if check_unknown_verification():
+                    page = "risk_verification"
         except Exception as exc:
             page = f"probe_error:{type(exc).__name__}"
+            run_log.emit("probe_error", error=f"{type(exc).__name__}: {exc}", phase=controller.phase)
         state.record_probe(page)
         decision = controller.observe(page)
+        if decision.status is not None:
+            # 终态先撤销输入，后面的日志和终端输出可能比一次点击还慢。
+            controlled_event.set()
+            requests.clear()
+            state.finish(decision.status)
+            stop_event.set()
+        if (
+            decision.action is not None
+            or decision.clear_pending
+            or decision.status is not None
+            or decision.previous_phase != decision.phase
+        ):
+            # 这里只把决策交给后台记录，不增加页面读取或同步写盘。
+            run_log.emit(
+                "state_decision",
+                page=page,
+                previous_phase=decision.previous_phase,
+                phase=decision.phase,
+                action=decision.action,
+                clear_pending=decision.clear_pending,
+                status=decision.status,
+            )
 
         if controller.controlled:
             controlled_event.set()
@@ -56,6 +90,9 @@ def run_tail_probe_loop(
             requests.clear()
         if decision.action is not None:
             requests.request(decision.action)
+        if getattr(controller, "continuous_main", False) and not controller.controlled:
+            # 先清掉旧异常请求再恢复主连点，避免恢复后误点旧弹窗位置。
+            controlled_event.clear()
 
         if (
             decision.previous_phase != decision.phase
@@ -81,9 +118,9 @@ def run_tail_probe_loop(
             print(json.dumps(probe_record, ensure_ascii=False), flush=True)
 
         if decision.status is not None:
-            requests.clear()
-            state.finish(decision.status)
-            stop_event.set()
+            run_log.emit("stop_requested", reason=decision.status)
+            if decision.status == "verification_required":
+                print("已停止自动输入，请在手机上手动处理安全验证。", flush=True)
             break
 
         completed_at = time.perf_counter()
@@ -92,4 +129,6 @@ def run_tail_probe_loop(
             if controller.phase == "risk_back_requested"
             else state_check_interval_s
         )
+        if purchase_ready is not None and not purchase_ready.is_set():
+            interval = max(interval, .25)
         next_probe = completed_at + interval
