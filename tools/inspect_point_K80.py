@@ -22,6 +22,8 @@ from precheck_K80 import (  # noqa: E402
     foreground_activity,
     load_constants,
     resolve_serial,
+    XIAOMI_15_MODEL,
+    parse_page,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -69,7 +71,15 @@ def main() -> int:
     print(f"层级已保存：{out}\n")
     root = ET.fromstring(xml)
 
-    for name in ("MAIN_ACTION_POINT", "RETRY_DIALOG_POINT"):
+    model = adb.shell("getprop ro.product.model")
+    consts = load_constants(model)
+    if model == XIAOMI_15_MODEL:
+        page, point = parse_page(xml, tuple(device.window_size()))
+        print(f"小米 15 页面：{page}，允许操作点：{point}")
+        names = ("MAIN_ACTION_POINT",)
+    else:
+        names = ("MAIN_ACTION_POINT", "RETRY_DIALOG_POINT")
+    for name in names:
         x, y = consts[name]  # type: ignore[misc]
         print(f"== {name} ({x},{y}) 命中（从小到大）==")
         for _, node, box in hits_at(root, x, y)[:5]:

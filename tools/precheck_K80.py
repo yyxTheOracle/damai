@@ -1,4 +1,4 @@
-"""REDMI K80 一键预检（只读，不点击、不修改手机设置）。
+"""REDMI K80 / 小米 15 预检，只读设备信息与当前页面。
 
 用法（项目根目录）：
     .\\.venv-phone\\Scripts\\python.exe tools\\precheck_K80.py
@@ -24,8 +24,12 @@ import urllib.request
 from xml.etree import ElementTree as ET
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+from device_support import SCREEN_SIZES, XIAOMI_15_MODEL, XIAOMI_15_MAIN_ACTION_POINT, default_adb_path
+from xiaomi_ui import ALIPAY_PACKAGE, parse_page
+
 TARGET_SCRIPT = ROOT / "scripts" / "damai_mode0_K80.py"
-DEFAULT_ADB = ROOT / "platform-tools" / "adb.exe"
+DEFAULT_ADB = default_adb_path()
 EXPECTED_MODEL = "24117RK2CC"
 TAOBAO_TIME_URL = "https://api.m.taobao.com/rest/api3.do?api=mtop.common.getTimestamp"
 NTP_SERVER = "ntp.aliyun.com"
@@ -40,7 +44,7 @@ def report(level: str, item: str, detail: str) -> None:
     print(f"[{level:<4}] {item}: {detail}", flush=True)
 
 
-def load_constants() -> dict[str, object]:
+def load_constants(model: str = "") -> dict[str, object]:
     """Read literal constants from the K80 script without importing it."""
     wanted = {
         "DEVICE_SERIAL",
@@ -48,10 +52,9 @@ def load_constants() -> dict[str, object]:
         "MAIN_ACTION_POINT",
         "RETRY_DIALOG_POINT",
         "DAMAI_PACKAGE",
-        "ALIPAY_PACKAGE",
     }
     tree = ast.parse(TARGET_SCRIPT.read_text(encoding="utf-8"))
-    found: dict[str, object] = {}
+    found: dict[str, object] = {"ALIPAY_PACKAGE": ALIPAY_PACKAGE}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
             target = node.targets[0]
@@ -60,6 +63,9 @@ def load_constants() -> dict[str, object]:
     missing = wanted - found.keys()
     if missing:
         raise RuntimeError(f"{TARGET_SCRIPT.name} 缺少常量：{sorted(missing)}")
+    found["EXPECTED_SCREEN_SIZE"] = SCREEN_SIZES.get(model, found["EXPECTED_SCREEN_SIZE"])
+    if model == XIAOMI_15_MODEL:
+        found["MAIN_ACTION_POINT"] = XIAOMI_15_MAIN_ACTION_POINT
     return found
 
 
@@ -156,7 +162,7 @@ def check_device(adb: Adb) -> bool:
         report("WARN", "多设备", f"同时连接了 {len(lines)} 台设备，脚本只会操作 {adb.serial}")
     model = adb.shell("getprop ro.product.model")
     name = adb.shell("getprop ro.product.marketname")
-    if model == EXPECTED_MODEL:
+    if model in SCREEN_SIZES:
         report("OK", "机型", f"{name} ({model})")
     else:
         report("WARN", "机型", f"{name} ({model})，不是 K80（{EXPECTED_MODEL}），坐标可能不适用")
@@ -178,8 +184,7 @@ def check_resolution(adb: Adb, expected: tuple[int, int]) -> None:
             "FAIL",
             "分辨率",
             f"当前生效 {effective[0]}x{effective[1]}（物理 {physical[0]}x{physical[1]}），"
-            f"脚本需要 {expected[0]}x{expected[1]}。请在手机：设置 → 显示与亮度 → "
-            "屏幕分辨率 → 选「WQHD+」，然后重新预检",
+            f"脚本需要 {expected[0]}x{expected[1]}。请检查屏幕分辨率和竖屏方向后重新预检",
         )
     report("INFO", "DPI", adb.shell("wm density").replace("\n", "; "))
 
@@ -345,6 +350,13 @@ def check_uiautomator(
     except Exception as exc:
         report("WARN", "坐标命中", f"读取界面层级失败：{exc}")
         return
+    if adb.shell("getprop ro.product.model") == XIAOMI_15_MODEL:
+        page, measured = parse_page(ET.tostring(root, encoding="unicode"), size)
+        if measured is None:
+            report("FAIL", "小米页面识别", f"页面 {page} 没有唯一可操作按钮，或固定点 {point} 不在按钮内，请检查当前页面")
+        else:
+            report("OK", "小米页面识别", f"页面 {page}，可操作点 {measured}；主按钮固定点为 {point}")
+        return
     hits = []
     for node in root.iter("node"):
         box = bounds_of(node)
@@ -372,22 +384,23 @@ def check_uiautomator(
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="REDMI K80 抢票前一键预检（只读）")
-    parser.add_argument("--adb", type=Path, default=DEFAULT_ADB, help="adb.exe 路径")
+    parser = argparse.ArgumentParser(description="REDMI K80 / 小米 15 抢票前预检")
+    parser.add_argument("--adb", type=Path, default=DEFAULT_ADB, help="本机 adb 路径")
     parser.add_argument("--skip-time", action="store_true", help="跳过联网校时检查")
     args = parser.parse_args()
 
     consts = load_constants()
     serial = resolve_serial(args.adb, str(consts["DEVICE_SERIAL"]))
-    expected = tuple(consts["EXPECTED_SCREEN_SIZE"])
     damai = str(consts["DAMAI_PACKAGE"])
-    print(f"== REDMI K80 预检 {datetime.now():%Y-%m-%d %H:%M:%S} ==")
+    print(f"== 手机预检 {datetime.now():%Y-%m-%d %H:%M:%S} ==")
     print(f"目标脚本：{TARGET_SCRIPT}")
-    print(f"序列号：{serial}  校准分辨率：{expected[0]}x{expected[1]}\n")
+    print(f"序列号：{serial}\n")
 
     adb = Adb(args.adb, serial)
     try:
         if check_adb(adb) and check_device(adb):
+            consts = load_constants(adb.shell("getprop ro.product.model"))
+            expected = tuple(consts["EXPECTED_SCREEN_SIZE"])
             check_resolution(adb, expected)
             check_packages(adb, damai, str(consts["ALIPAY_PACKAGE"]))
             check_foreground(adb, damai)
@@ -408,7 +421,7 @@ def main() -> int:
         print("存在 FAIL，请先修复再运行 scripts\\damai_mode0_K80.py")
     else:
         print("预检通过。开抢前把手机停在目标演唱会详情页，然后运行：")
-        print('  .\\.venv-phone\\Scripts\\python.exe scripts\\damai_mode0_K80.py "YYYY-MM-DD HH:MM:SS"')
+        print(f'  "{sys.executable}" scripts/damai_mode0_K80.py "YYYY-MM-DD HH:MM:SS"')
     return 1 if fails else 0
 
 
