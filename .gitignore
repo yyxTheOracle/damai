@@ -8,6 +8,10 @@ __pycache__/
 # 注意：这些文件里会有你的手机号、观演人姓名、订单信息，千万不要提交
 artifacts/
 
+# 本地实战截图裁图，仅供有原始记录时回放。
+/tools/fixtures/button_text/*.png
+/tools/fixtures/sale_suzhou/*.png
+
 # 本地下载的 Android platform-tools（体积大，各自从官方下载）
 platform-tools/
 platform-tools*.zip
